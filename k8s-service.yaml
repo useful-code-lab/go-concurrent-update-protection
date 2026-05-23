@@ -1,36 +1,77 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: go-service-deployment
-  labels:
-    app: go-service
+  name: postgres-deployment
 spec:
-  replicas: 1 # Строго 1 копия, так как база данных пока внутри памяти Go
+  replicas: 1
   selector:
     matchLabels:
-      app: go-service
+      app: postgres
   template:
     metadata:
       labels:
-        app: go-service
+        app: postgres
     spec:
       containers:
-      - name: go-app
-        image: go-counter-service:v1
-        imagePullPolicy: Never # Берем локальный образ (актуально для Minikube)
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          value: "password"
+        - name: POSTGRES_DB
+          value: "concur_db"
         ports:
-        - containerPort: 8080
+        - containerPort: 5432
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: go-service-lb
+  name: postgres-service
 spec:
-  type: NodePort # Открывает порт наружу для тестирования
   selector:
-    app: go-service
+    app: postgres
   ports:
     - protocol: TCP
-      port: 8080      # Порт самого сервиса внутри K8s
-      targetPort: 8080 # Порт, который слушает Go-приложение
-      nodePort: 30080  # Порт на вашем компьютере (доступен в браузере/curl)
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: concur-res-deployment
+spec:
+  replicas: 2 # Теперь можно запускать ХОТЬ 2, ХОТЬ 5 подов! База всё синхронизирует.
+  selector:
+    matchLabels:
+      app: concur-res
+  template:
+    metadata:
+      labels:
+        app: concur-res
+    spec:
+      containers:
+      - name: concur-res-container
+        image: concur-res-app:v1
+        imagePullPolicy: Never # Важно для Minikube, чтобы не лезть в интернет
+        ports:
+        - containerPort: 8080
+        env:
+        # Указываем путь к нашей K8s-базе данных postgres-service
+        - name: DATABASE_URL
+          value: "postgres://postgres:password@postgres-service:5432/concur_db?sslmode=disable"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: concur-res-lb
+spec:
+  type: NodePort
+  selector:
+    app: concur-res
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080

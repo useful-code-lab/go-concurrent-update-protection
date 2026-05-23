@@ -20,4 +20,4 @@ aleksey@aleksey:~/concur-res$
 ```bash
 curl -X PUT -d '{"data":"Привет от Юзера 2","version":1}' http://localhost:8080/resource
 # Ответ: Конфликт: ресурс уже изменен другим пользователем
-```
+``` 
