@@ -63,4 +63,24 @@ Content-Length: 53
 [1]+  Завершён        curl -i -X PUT -d '{"data":"Запись от А","version":2}' http://localhost:30080/resource/pessimistic
 ```
 
+## Проверка блокировки с помощью Redis
+```bash
+$ curl -i -X PUT -d '{"data":"Юзер 1 (Redis)"}' http://localhost:8080/resource/redis & \
+curl -i -X PUT -d '{"data":"Юзер 2 (Redis)"}' http://localhost:8080/resource/redis
+wait
+[1] 39428
+HTTP/1.1 423 Locked
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Sat, 23 May 2026 19:50:53 GMT
+Content-Length: 80
 
+Ресурс заблокирован в Redis, попробуйте позже
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Sat, 23 May 2026 19:50:56 GMT
+Content-Length: 51
+
+{"id":"1","data":"Юзер 1 (Redis)","version":2}
+[1]+  Завершён        curl -i -X PUT -d '{"data":"Юзер 1 (Redis)"}' http://localhost:8080/resource/redis
+```
