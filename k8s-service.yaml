@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-service-deployment
+  labels:
+    app: go-service
+spec:
+  replicas: 1 # Строго 1 копия, так как база данных пока внутри памяти Go
+  selector:
+    matchLabels:
+      app: go-service
+  template:
+    metadata:
+      labels:
+        app: go-service
+    spec:
+      containers:
+      - name: go-app
+        image: go-counter-service:v1
+        imagePullPolicy: Never # Берем локальный образ (актуально для Minikube)
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-service-lb
+spec:
+  type: NodePort # Открывает порт наружу для тестирования
+  selector:
+    app: go-service
+  ports:
+    - protocol: TCP
+      port: 8080      # Порт самого сервиса внутри K8s
+      targetPort: 8080 # Порт, который слушает Go-приложение
+      nodePort: 30080  # Порт на вашем компьютере (доступен в браузере/curl)
