@@ -37,12 +37,46 @@ spec:
       port: 5432
       targetPort: 5432
 ---
+# ДОБАВЛЕНО: Манифест для запуска Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+# ДОБАВЛЕНО: Сетевая служба для Redis
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: concur-res-deployment
 spec:
-  replicas: 2 # Теперь можно запускать ХОТЬ 2, ХОТЬ 5 подов! База всё синхронизирует.
+  replicas: 2
   selector:
     matchLabels:
       app: concur-res
@@ -53,14 +87,27 @@ spec:
     spec:
       containers:
       - name: concur-res-container
-        image: concur-res-app:v1
-        imagePullPolicy: Never # Важно для Minikube, чтобы не лезть в интернет
+        image: concur-res-app:v4 # Рекомендуется обновить код до v4 с Retry из прошлых шагов
+        imagePullPolicy: Never
         ports:
         - containerPort: 8080
         env:
-        # Указываем путь к нашей K8s-базе данных postgres-service
         - name: DATABASE_URL
           value: "postgres://postgres:password@postgres-service:5432/concur_db?sslmode=disable"
+        - name: REDIS_URL
+          value: "redis-service:6379"
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10  
 ---
 apiVersion: v1
 kind: Service

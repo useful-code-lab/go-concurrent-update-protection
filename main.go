@@ -9,8 +9,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/bsm/redislock"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 type Resource struct {
@@ -19,38 +22,76 @@ type Resource struct {
 	Version int    `json:"version"`
 }
 
-// Глобальный пул соединений с базой данных
-var dbPool *pgxpool.Pool
+var (
+	dbPool      *pgxpool.Pool
+	redisClient *redis.Client
+)
 
 func main() {
-	// Берем строку подключения из переменной окружения (понадобится для K8s)
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		// Локальный дефолт для тестов
 		dbURL = "postgres://postgres:password@localhost:5432/concur_db?sslmode=disable"
 	}
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "localhost:6379"
+	}
 
-	var err error
 	ctx := context.Background()
 
-	// Подключаемся к PostgreSQL
-	dbPool, err = pgxpool.New(ctx, dbURL)
+	// 1. ПОДКЛЮЧЕНИЕ К POSTGRESQL С ПОВТОРАМИ (Retry)
+	var err error
+	for i := 1; i <= 10; i++ { // 10 попыток
+		log.Printf("Попытка подключения к PostgreSQL %d/10...\n", i)
+		dbPool, err = pgxpool.New(ctx, dbURL)
+		if err == nil {
+			// Проверяем реальное соединение
+			err = dbPool.Ping(ctx)
+			if err == nil {
+				log.Println("Успешно подключено к PostgreSQL!")
+				break
+			}
+		}
+		log.Printf("Ожидание базы данных: %v. Повтор через 2 секунды...\n", err)
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		log.Fatalf("Не удалось подключиться к БД: %v\n", err)
+		log.Fatalf("Не удалось подключиться к БД после 10 попыток: %v\n", err)
 	}
 	defer dbPool.Close()
-
-	// Инициализируем таблицу при старте (для простоты примера)
 	initDatabase(ctx)
 
-	http.HandleFunc("/resource", handleResource)
+	// 2. ПОДКЛЮЧЕНИЕ К REDIS С ПОВТОРАМИ (Retry)
+	redisClient = redis.NewClient(&redis.Options{Addr: redisURL})
+	for i := 1; i <= 10; i++ {
+		log.Printf("Попытка подключения к Redis %d/10...\n", i)
+		err = redisClient.Ping(ctx).Err()
+		if err == nil {
+			log.Println("Успешно подключено к Redis!")
+			break
+		}
+		log.Printf("Ожидание Redis: %v. Повтор через 2 секунды...\n", err)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Printf("Предупреждение: Redis окончательно недоступен: %v\n", err)
+	}
 
-	fmt.Println("Сервер concur-res (с PostgreSQL) запущен на :8080")
+	// Регистрируем хендлеры для проверки готовности Kubernetes (Healthchecks)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	http.HandleFunc("/resource/optimistic", handleOptimistic)
+	http.HandleFunc("/resource/pessimistic", handlePessimistic)
+	http.HandleFunc("/resource/redis", handleRedisLock)
+
+	fmt.Println("Сервер concur-res запущен на :8080 с 3-мя видами конкурентности!")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func initDatabase(ctx context.Context) {
-	// Создаем таблицу, если её нет
 	query := `
 	CREATE TABLE IF NOT EXISTS resources (
 		id TEXT PRIMARY KEY,
@@ -65,65 +106,102 @@ func initDatabase(ctx context.Context) {
 	}
 }
 
-func handleResource(w http.ResponseWriter, r *http.Request) {
+// === 1. ОПТИМИСТИЧЕСКАЯ БЛОКИРОВКА ===
+func handleOptimistic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Only PUT allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
+	var input Resource
+	json.NewDecoder(r.Body).Decode(&input)
+
+	query := `UPDATE resources SET data = $1, version = version + 1 WHERE id = '1' AND version = $2 RETURNING version;`
+	var newVersion int
+	err := dbPool.QueryRow(r.Context(), query, input.Data, input.Version).Scan(&newVersion)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || err.Error() == "no rows in result set" {
+			http.Error(w, "Конфликт: ресурс изменен другим пользователем", http.StatusConflict)
+			return
+		}
+		http.Error(w, "Ошибка БД", 500)
+		return
+	}
+	input.ID = "1"
+	input.Version = newVersion
+	json.NewEncoder(w).Encode(input)
+}
+
+// === 2. ПЕССИМИСТИЧЕСКАЯ БЛОКИРОВКА ===
+func handlePessimistic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Only PUT allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	var input Resource
+	json.NewDecoder(r.Body).Decode(&input)
+
 	ctx := r.Context()
-
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		id = "1" // по умолчанию
+	tx, err := dbPool.Begin(ctx)
+	if err != nil {
+		http.Error(w, "Tx error", 500)
+		return
 	}
+	defer tx.Rollback(ctx)
 
-	switch r.Method {
+	var current Resource
+	tx.QueryRow(ctx, "SELECT id, data, version FROM resources WHERE id='1' FOR UPDATE").Scan(&current.ID, &current.Data, &current.Version)
 
-	case http.MethodGet:
-		var res Resource
-		// Просто читаем текущие данные из БД
-		err := dbPool.QueryRow(ctx, "SELECT id, data, version FROM resources WHERE id=$1", id).
-			Scan(&res.ID, &res.Data, &res.Version)
+	time.Sleep(3 * time.Second) // Имитируем задержку для проверки очереди
 
-		if err != nil {
-			http.Error(w, "Ресурс не найден", http.StatusNotFound)
-			return
-		}
-		json.NewEncoder(w).Encode(res)
+	newVersion := current.Version + 1
+	tx.Exec(ctx, "UPDATE resources SET data = $1, version = $2 WHERE id = '1'", input.Data, newVersion)
+	tx.Commit(ctx)
 
-	case http.MethodPut:
-		var input Resource
-		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-			http.Error(w, "Ошибка в JSON", http.StatusBadRequest)
-			return
-		}
+	input.ID = "1"
+	input.Version = newVersion
+	json.NewEncoder(w).Encode(input)
+}
 
-		// ГЛАВНЫЙ СЕКРЕТ КОНКУРЕНТНОСТИ:
-		// Мы обновляем строку ТОЛЬКО если присланная версия совпадает с версией в БД.
-		// В этом же запросе мы инкрементируем версию: version = version + 1
-		query := `
-			UPDATE resources 
-			SET data = $1, version = version + 1 
-			WHERE id = $2 AND version = $3
-			RETURNING version;
-		`
-
-		var newVersion int
-		err := dbPool.QueryRow(ctx, query, input.Data, id, input.Version).Scan(&newVersion)
-
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) || err.Error() == "no rows in result set" {
-				// Если ни одна строка не обновилась, значит версия в БД уже изменилась (конфликт!)
-				http.Error(w, "Конфликт: ресурс уже изменен другим пользователем в БД", http.StatusConflict)
-				return
-			}
-			http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
-			return
-		}
-
-		// Возвращаем успешный результат с новой версией
-		input.ID = id
-		input.Version = newVersion
-		json.NewEncoder(w).Encode(input)
-
-	default:
-		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+// === 3. РАСПРЕДЕЛЕННАЯ БЛОКИРОВКА ЧЕРЕЗ REDIS (Дополнение) ===
+func handleRedisLock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Only PUT allowed", http.StatusMethodNotAllowed)
+		return
 	}
+	w.Header().Set("Content-Type", "application/json")
+	var input Resource
+	json.NewDecoder(r.Body).Decode(&input)
+
+	ctx := r.Context()
+	// Создаем менеджер блокировок Redis
+	locker := redislock.New(redisClient)
+
+	log.Println("--> Пробуем занять ключ в Redis...")
+	// Пытаемся захватить ключ на 4 секунды. Если занят — отдаем статус 423 (Locked)
+	lock, err := locker.Obtain(ctx, "lock:resource:1", 4*time.Second, nil)
+	if err == redislock.ErrNotObtained {
+		http.Error(w, "Ресурс заблокирован в Redis, попробуйте позже", http.StatusLocked)
+		return
+	} else if err != nil {
+		http.Error(w, "Ошибка Redis-локера", 500)
+		return
+	}
+	defer lock.Release(ctx) // Гарантированно освобождаем ключ в Redis при выходе
+
+	log.Println("Ключ в Redis успешно захвачен! Работаем с БД...")
+	time.Sleep(3 * time.Second) // Имитируем работу
+
+	// Безопасно обновляем БД (блокировки на уровне БД не нужны, Redis нас защищает)
+	var currentVersion int
+	dbPool.QueryRow(ctx, "SELECT version FROM resources WHERE id='1'").Scan(&currentVersion)
+	newVersion := currentVersion + 1
+	dbPool.Exec(ctx, "UPDATE resources SET data = $1, version = $2 WHERE id = '1'", input.Data, newVersion)
+
+	log.Println("<-- Работа завершена, отпускаем Redis")
+	input.ID = "1"
+	input.Version = newVersion
+	json.NewEncoder(w).Encode(input)
 }
